@@ -1,0 +1,11 @@
+[package]
+name = "freeflow"
+version = "0.1.0"
+edition = "2024"
+homepage = "https://github.com/lichuang/freeflow"
+keywords = ["lock-free"]
+license = "Apache-2.0"
+repository = "https://github.com/lichuang/freeflow"
+
+[dependencies]
+haphazard = "0.1.8"
