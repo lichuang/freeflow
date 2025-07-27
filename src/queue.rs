@@ -16,7 +16,6 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use haphazard::AtomicPtr;
-use haphazard::Domain;
 use haphazard::HazardPointer;
 use haphazard::raw::Pointer;
 
@@ -57,48 +56,49 @@ impl<T: Sync + Send> Queue<T> {
 
   pub fn push(&self, data: T) {
     let new_node: *mut Node<T> = Box::new(Node::new(data)).into_raw();
-    let mut hp = HazardPointer::new_in_domain(Domain::global());
+    let mut hp = HazardPointer::default();
     // Repeat until completing step 1
     loop {
       // Atomic reads
       let tail = self.tail.safe_load(&mut hp).unwrap();
       let next = tail.next.load_ptr();
       if !next.is_null() {
-        // Try to help the enqueue of next
-        // Step 2 (Helping another thread)
+        // case 1: if next is not null, it means another thread:
+        // 1. has change next to a new node
+        // 2. but has not update tail
+        // Try to help update tail to the (not null) next
         unsafe {
           let _ = self
             .tail
             .compare_exchange_ptr(tail as *const Node<T> as *mut Node<T>, next);
         };
-      } else {
-        // Try to enqueue the node by updating the tail.next
-        // Step 1
-        if unsafe {
-          tail
-            .next
-            .compare_exchange_ptr(std::ptr::null_mut(), new_node)
-        }
-        .is_ok()
-        // Did the CAS succeed?
-        {
-          // Try to bump up self.tail to new_node
-          // Step 2
-          unsafe {
-            let _ = self
-              .tail
-              .compare_exchange_ptr(tail as *const Node<T> as *mut Node<T>, new_node);
-          };
-          return;
-        }
+        continue;
+      }
+
+      // case 2: next is null
+      // Step 1: change next to a new node
+      if unsafe {
+        tail
+          .next
+          .compare_exchange_ptr(std::ptr::null_mut(), new_node)
+      }
+      .is_ok()
+      {
+        // Step 2: Try to update self.tail to new node
+        unsafe {
+          let _ = self
+            .tail
+            .compare_exchange_ptr(tail as *const Node<T> as *mut Node<T>, new_node);
+        };
+        return;
       }
     }
   }
 
   pub fn pop(&self) -> Option<T> {
     loop {
-      let mut hp_head = HazardPointer::new_in_domain(Domain::global());
-      let mut hp_next = HazardPointer::new_in_domain(Domain::global());
+      let mut hp_head = HazardPointer::default();
+      let mut hp_next = HazardPointer::default();
       // Atomic reads
       let head = self
         .head
@@ -108,20 +108,22 @@ impl<T: Sync + Send> Queue<T> {
       let next_ptr = head.next.load_ptr();
       let tail_ptr = self.tail.load_ptr();
 
-      if head_ptr != tail_ptr {
-        // Queue is not empty!
-        // Dequeue step 1
-        let next = head.next.safe_load(&mut hp_next).unwrap();
-        if let Ok(unlinked_head_ptr) = unsafe { self.head.compare_exchange_ptr(head_ptr, next_ptr) }
-        {
-          // Successful dequeue
-          unsafe {
-            unlinked_head_ptr.unwrap().retire();
-          }
+      // Empty queue
+      if head_ptr == tail_ptr {
+        return None;
+      }
 
-          // Take and return ownership of the data.
-          return Some(unsafe { std::ptr::read(next.data.assume_init_ref() as *const _) });
+      // Queue is not empty!
+      // Dequeue step 1
+      let next = head.next.safe_load(&mut hp_next).unwrap();
+      if let Ok(unlinked_head_ptr) = unsafe { self.head.compare_exchange_ptr(head_ptr, next_ptr) } {
+        // successful dequeue head node from queue
+        unsafe {
+          unlinked_head_ptr.unwrap().retire();
         }
+
+        // take and return ownership of the data.
+        return Some(unsafe { std::ptr::read(next.data.assume_init_ref() as *const _) });
       } else if !next_ptr.is_null() {
         // Help partial enqueue
         // Enqueue step 2
@@ -130,9 +132,6 @@ impl<T: Sync + Send> Queue<T> {
             .tail
             .compare_exchange_ptr(tail_ptr as *mut Node<T>, next_ptr);
         }
-      } else {
-        // Empty queue
-        return None;
       }
     }
   }
