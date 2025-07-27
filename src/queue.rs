@@ -19,6 +19,9 @@ use haphazard::AtomicPtr;
 use haphazard::HazardPointer;
 use haphazard::raw::Pointer;
 
+/// Implementation of Michael-Scott Queue(<<Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms>>)
+/// using haphazard pointer(https://github.com/jonhoo/haphazard).
+
 struct Node<T> {
   data: MaybeUninit<T>,
   next: AtomicPtr<Node<T>>,
@@ -32,7 +35,7 @@ impl<T> Node<T> {
     }
   }
 
-  fn sentinel() -> Self {
+  fn dummy() -> Self {
     Node {
       data: MaybeUninit::uninit(),
       next: unsafe { AtomicPtr::new(ptr::null_mut()) },
@@ -47,24 +50,23 @@ pub struct Queue<T> {
 
 impl<T: Sync + Send> Queue<T> {
   pub fn new() -> Self {
-    let sentinel_ptr = Box::new(Node::sentinel()).into_raw();
+    let dummy_ptr = Box::new(Node::dummy()).into_raw();
     Queue {
-      head: unsafe { AtomicPtr::new(sentinel_ptr) },
-      tail: unsafe { AtomicPtr::new(sentinel_ptr) },
+      head: unsafe { AtomicPtr::new(dummy_ptr) },
+      tail: unsafe { AtomicPtr::new(dummy_ptr) },
     }
   }
 
   pub fn push(&self, data: T) {
     let new_node: *mut Node<T> = Box::new(Node::new(data)).into_raw();
     let mut hp = HazardPointer::default();
-    // Repeat until completing step 1
+    // Repeat until finished step 1 and step2
     loop {
-      // Atomic reads
       let tail = self.tail.safe_load(&mut hp).unwrap();
       let next = tail.next.load_ptr();
       if !next.is_null() {
         // case 1: if next is not null, it means another thread:
-        // 1. has change next to a new node
+        // 1. has change tail->next to a new node
         // 2. but has not update tail
         // Try to help update tail to the (not null) next
         unsafe {
@@ -76,7 +78,7 @@ impl<T: Sync + Send> Queue<T> {
       }
 
       // case 2: next is null
-      // Step 1: change next to a new node
+      // Step 1: change tail->next to a new node
       if unsafe {
         tail
           .next
@@ -96,6 +98,7 @@ impl<T: Sync + Send> Queue<T> {
   }
 
   pub fn pop(&self) -> Option<T> {
+    // Repeat until queue is empty or dequeue head from queue
     loop {
       let mut hp_head = HazardPointer::default();
       let mut hp_next = HazardPointer::default();
@@ -125,8 +128,7 @@ impl<T: Sync + Send> Queue<T> {
         // take and return ownership of the data.
         return Some(unsafe { std::ptr::read(next.data.assume_init_ref() as *const _) });
       } else if !next_ptr.is_null() {
-        // Help partial enqueue
-        // Enqueue step 2
+        // in this case, it means that another thread is pushing data to queue but has not complete step2(see `push`)
         unsafe {
           let _ = self
             .tail
